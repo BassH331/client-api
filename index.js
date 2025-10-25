@@ -1,125 +1,197 @@
 import 'dotenv/config';
 import fetch from "node-fetch";
+import express from "express";
 import { createClient } from "@supabase/supabase-js";
 
-// Connect to Supabase using environment variables
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
-);
+// Connect to Supabase using environment variables (prefer service role if provided)
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.SUPABASE_ANON_KEY;
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // Weather API URL
 const weatherUrl = "https://soil-api-vgqa.vercel.app/current";
 
-// CRUD Operations for Weather Data
-async function createWeatherObservation(farmName, latitude, longitude, data) {
-  const { data: result, error } = await supabase
-    .from("weather_observations")
-    .insert([{
-      farm_name: farmName,
-      latitude: latitude,
-      longitude: longitude,
-      data: data,
-      created_at: new Date()
-    }])
-    .select();
+// Target row id (edit this or set PUSH_TARGET_ID in .env)
+const PUSH_TARGET_ID = process.env.PUSH_TARGET_ID ?? "e6f74576-8913-4def-9f54-fb08f926b7b2";
 
-  if (error) throw error;
-  return result;
+// Map incoming payload to primitives (strings / numbers)
+function mapToPrimitives(weatherData) {
+  const observedAt = weatherData.datetime_utc ? new Date(weatherData.datetime_utc) : new Date();
+
+  const locationName = (weatherData.location && weatherData.location.name)
+    ? String(weatherData.location.name)
+    : "Unknown";
+
+  const cloudiness = (weatherData.clouds && typeof weatherData.clouds.cloudiness_percent !== "undefined")
+    ? Number(weatherData.clouds.cloudiness_percent)
+    : null;
+
+  const temperature = (weatherData.main && typeof weatherData.main.temperature_c !== "undefined")
+    ? Number(weatherData.main.temperature_c)
+    : null;
+
+  const humidity = (weatherData.main && typeof weatherData.main.humidity_percent !== "undefined")
+    ? Number(weatherData.main.humidity_percent)
+    : null;
+
+  const pressure = (weatherData.main && typeof weatherData.main.pressure_hpa !== "undefined")
+    ? Number(weatherData.main.pressure_hpa)
+    : null;
+
+  const rain3h = weatherData.precipitation && weatherData.precipitation.rain_3h_mm !== undefined
+    ? (weatherData.precipitation.rain_3h_mm === "N/A" ? null : Number(weatherData.precipitation.rain_3h_mm))
+    : null;
+
+  const snow3h = weatherData.precipitation && weatherData.precipitation.snow_3h_mm !== undefined
+    ? (weatherData.precipitation.snow_3h_mm === "N/A" ? null : Number(weatherData.precipitation.snow_3h_mm))
+    : null;
+
+  const weatherDesc = weatherData.weather && weatherData.weather.description
+    ? String(weatherData.weather.description)
+    : null;
+
+  const weatherIcon = weatherData.weather && weatherData.weather.icon
+    ? String(weatherData.weather.icon)
+    : null;
+
+  const windSpeed = (weatherData.wind && typeof weatherData.wind.speed_ms !== "undefined")
+    ? Number(weatherData.wind.speed_ms)
+    : null;
+
+  const windGust = (weatherData.wind && typeof weatherData.wind.gust_ms !== "undefined")
+    ? Number(weatherData.wind.gust_ms)
+    : null;
+
+  const windDeg = (weatherData.wind && typeof weatherData.wind.direction_degrees !== "undefined")
+    ? Number(weatherData.wind.direction_degrees)
+    : null;
+
+  // raw_payload will be a simple object with only primitives (no nested objects)
+  const rawPayload = {
+    icon: weatherIcon ?? null,
+    humidity: humidity ?? null,
+    pressure: pressure ?? null,
+    wind_gust: windGust ?? null,
+    wind_deg: windDeg ?? null,
+    rain_3h: rain3h,
+    snow_3h: snow3h
+  };
+
+  return {
+    observed_at: observedAt.toISOString(),
+    location: locationName,
+    clouds: cloudiness,
+    main: temperature,
+    precipitation: rain3h ?? snow3h ?? null,
+    weather: weatherDesc,
+    wind: windSpeed,
+    raw_payload: rawPayload
+  };
 }
 
-async function getWeatherObservations(options = {}) {
-  let query = supabase
-    .from("weather_observations")
-    .select("*");
-
-  if (options.farmName) {
-    query = query.eq('farm_name', options.farmName);
-  }
-  if (options.dateRange) {
-    query = query.gte('created_at', options.dateRange.start)
-                .lte('created_at', options.dateRange.end);
-  }
-  if (options.limit) {
-    query = query.limit(options.limit);
-  }
-
-  const { data, error } = await query;
-  if (error) throw error;
-  return data;
-}
-
-async function updateWeatherObservation(id, updates) {
-  const { data, error } = await supabase
-    .from("weather_observations")
-    .update(updates)
-    .eq('id', id)
-    .select();
-
-  if (error) throw error;
-  return data;
-}
-
-async function deleteWeatherObservation(id) {
-  const { error } = await supabase
-    .from("weather_observations")
-    .delete()
-    .eq('id', id);
-
-  if (error) throw error;
-  return true;
-}
-
-// Modified seed function to use new CRUD operations
-async function seedWeatherData() {
+// Insert / update the single target row using upsert (onConflict id)
+async function pushObservation() {
   try {
-    const weatherRes = await fetch(weatherUrl);
-    const weatherData = await weatherRes.json();
-    
-    const result = await createWeatherObservation(
-      "University of Mpumalanga",
-      -25.43542,
-      30.98083,
-      weatherData
-    );
+    const res = await fetch(weatherUrl);
+    if (!res.ok) throw new Error(`fetch status ${res.status}`);
+    const weatherData = await res.json();
 
-    console.log("✅ Weather data stored successfully!", result);
-  } catch (error) {
-    console.error("❌ Error seeding weather data:", error);
+    const payload = mapToPrimitives(weatherData);
+
+    // prepare record with explicit id so upsert updates the same row
+    const record = {
+      id: PUSH_TARGET_ID,
+      observed_at: payload.observed_at,
+      location: payload.location,       // stored as JSON scalar (string) into jsonb column
+      location_point: null,
+      clouds: payload.clouds,
+      main: payload.main,
+      precipitation: payload.precipitation,
+      weather: payload.weather,
+      wind: payload.wind,
+      raw_payload: payload.raw_payload
+    };
+
+    // upsert with onConflict 'id' ensures the single row is updated (or created once)
+    const { data, error } = await supabase
+      .from("weather_observations")
+      .upsert([record], { onConflict: 'id' })
+      .select();
+
+    if (error) {
+      console.error("❌ Supabase upsert error:", error);
+      return { ok: false, error };
+    }
+
+    return { ok: true, data };
+  } catch (err) {
+    console.error("❌ Error pushing observation:", err);
+    return { ok: false, error: err };
   }
 }
 
-// Example usage of CRUD operations
-async function example() {
-  try {
-    // Create initial data
-    await seedWeatherData();
+// Simple Express web client API to trigger push and run continuously
+const app = express();
+app.use(express.json());
 
-    // Read weather data with filters
-    const recentData = await getWeatherObservations({
-      farmName: "University of Mpumalanga",
-      limit: 5
+// Trigger immediate push (support POST and GET for convenience)
+app.post("/push-now", async (req, res) => {
+  const result = await pushObservation();
+  if (result.ok) return res.status(200).json({ status: "pushed", data: result.data });
+  return res.status(500).json({ status: "error", error: result.error });
+});
+
+app.get("/push-now", async (req, res) => {
+  const result = await pushObservation();
+  if (result.ok) return res.status(200).send("pushed");
+  return res.status(500).send("error");
+});
+
+// Health
+app.get("/health", (req, res) => res.status(200).send("ok"));
+
+// Start automatic pusher on launch (independent operation)
+const INTERVAL_SECONDS = Number(process.env.PUSH_INTERVAL_SECONDS ?? 30);
+let intervalHandle = null;
+
+function startPusher() {
+  if (intervalHandle) return;
+  intervalHandle = setInterval(() => {
+    pushObservation().then(r => {
+      if (r.ok) console.log("✅ pushed observation", new Date().toISOString());
     });
-    console.log("📊 Recent weather observations:", recentData);
-
-    // Update if we have data
-    if (recentData.length > 0) {
-      const updated = await updateWeatherObservation(recentData[0].id, {
-        farm_name: "UMP Updated"
-      });
-      console.log("✏️ Updated record:", updated);
-    }
-
-    // Delete oldest record
-    if (recentData.length > 0) {
-      await deleteWeatherObservation(recentData[0].id);
-      console.log("🗑️ Deleted oldest record");
-    }
-
-  } catch (error) {
-    console.error("❌ Error in example:", error);
-  }
+  }, INTERVAL_SECONDS * 1000);
+  // first immediate push
+  pushObservation().then(r => { if (r.ok) console.log("✅ initial push done"); });
 }
 
-// Run the example
-example();
+// allow manual control but auto-start regardless
+app.post("/start", (req, res) => {
+  startPusher();
+  return res.json({ status: "started", interval_seconds: INTERVAL_SECONDS });
+});
+app.get("/start", (req, res) => {
+  startPusher();
+  return res.send(`started; interval_seconds=${INTERVAL_SECONDS}`);
+});
+
+app.post("/stop", (req, res) => {
+  if (!intervalHandle) return res.status(400).json({ status: "not_running" });
+  clearInterval(intervalHandle);
+  intervalHandle = null;
+  return res.json({ status: "stopped" });
+});
+app.get("/stop", (req, res) => {
+  if (!intervalHandle) return res.status(400).send("not_running");
+  clearInterval(intervalHandle);
+  intervalHandle = null;
+  return res.send("stopped");
+});
+
+// Start server and auto-start pusher
+const PORT = Number(process.env.PORT ?? 3000);
+app.listen(PORT, () => {
+  console.log(`🚀 Weather push client running on port ${PORT}`);
+  console.log(`Auto-starting pusher (target id=${PUSH_TARGET_ID}) every ${INTERVAL_SECONDS}s`);
+  startPusher();
+});
